@@ -9,6 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -16,15 +17,17 @@ jobs:
           - variant: a8xx
             tag_suffix: "-a8xx-test"
             zip_suffix: "-A8xx"
-            extra_script: "patches/fix_a8xx_dev_info.py:patches/apply_a8xx_gpus.py"
-            meta_desc: "A8xx experimental Turnip driver for Snapdragon 8 Elite (A810/A825/A829/A830). Includes A8xx-specific patches on top of Mesa main. KGSL build."
+            extra_patch: "patches/a8xx_gen8.patch"
+            extra_script: "patches/a8xx_shared_mem.py:patches/a840v2.py"
+            meta_desc: "A8xx experimental Turnip driver with the full Gen8 patch stack, A8xx hang fixes, shared-memory adjustments, and KGSL support."
             release_label: "A8xx Experimental"
 
           - variant: a830-tuned
             tag_suffix: "-a830-tuned-test"
             zip_suffix: "-A830-Tuned"
-            extra_script: "patches/fix_a8xx_dev_info.py:patches/apply_a8xx_gpus.py:patches/tune_a830.py"
-            meta_desc: "A830 performance-tuned Turnip driver for Snapdragon 8 Elite. Disables has_fs_tex_prefetch for A830 per Mesa upstream TODO — matches behaviour of every other A8xx GPU. Experimental."
+            extra_patch: "patches/a8xx_gen8.patch"
+            extra_script: "patches/a8xx_shared_mem.py:patches/a840v2.py:patches/tune_a830.py"
+            meta_desc: "A830-tuned experimental Turnip driver with the full Gen8 patch stack and the A830 texture-prefetch workaround."
             release_label: "A830 Tuned"
 
     steps:
@@ -34,14 +37,27 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build patchelf unzip flex bison git perl python3-pip glslang-tools curl zip patch
+          sudo apt-get install -y \
+            ninja-build \
+            patchelf \
+            unzip \
+            flex \
+            bison \
+            git \
+            perl \
+            python3-pip \
+            glslang-tools \
+            curl \
+            zip \
+            patch
+
           pip3 install --break-system-packages meson mako
 
       - name: Build
         run: |
           chmod +x build_turnip.sh
           export BUILD_VERSION="${{ github.run_number }}"
-          export EXTRA_PATCH="patches/tu8_kgsl_26.patch"
+          export EXTRA_PATCH="${{ matrix.extra_patch }}"
           export EXTRA_SCRIPT="${{ matrix.extra_script }}"
           ./build_turnip.sh
 
@@ -56,82 +72,115 @@ jobs:
           GITHASH_FULL=$(git -C turnip_workdir/mesa rev-parse HEAD 2>/dev/null || echo "")
           COMMIT_DATE=$(git -C turnip_workdir/mesa log -1 --format="%ci" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
           COMMIT_TITLE=$(git -C turnip_workdir/mesa log -1 --format="%s" 2>/dev/null || echo "")
+
           TAG_SUFFIX="${{ matrix.tag_suffix }}"
           TAG="v${MESA_VERSION}-${BUILD_DATE}${TAG_SUFFIX}"
+
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
-            EXISTING=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName \
+            EXISTING=$(gh release list \
+              --repo "$GITHUB_REPOSITORY" \
+              --limit 100 \
+              --json tagName \
               | jq -r '.[].tagName' \
               | grep -oP "^v${MESA_VERSION}-${BUILD_DATE}${TAG_SUFFIX}-r\K[0-9]+$" \
               | sort -n \
               | tail -1)
+
             NEXT_R=$(( ${EXISTING:-1} + 1 ))
             TAG="${TAG}-r${NEXT_R}"
           fi
+
           if [[ "$TAG" =~ -r([0-9]+)$ ]]; then
             DAY_NUM="${BASH_REMATCH[1]}"
           else
             DAY_NUM="1"
           fi
+
           ZIP_SUFFIX="${{ matrix.zip_suffix }}"
           ZIP_NAME="Turnip-${TAG}${ZIP_SUFFIX}.zip"
+
           SRC=$(ls turnip_workdir/mesa-turnip-*.zip | head -1)
           UNZIP_DIR=$(mktemp -d)
+
           unzip -q "$SRC" -d "$UNZIP_DIR"
+
           META_NAME="Mesa Turnip ${TAG}${ZIP_SUFFIX}"
           META_DESC="${{ matrix.meta_desc }}"
-          python3 -c "import json,sys; p='${UNZIP_DIR}/meta.json'; m=json.load(open(p)); m['name']='${META_NAME}'; m['packageVersion']='${DAY_NUM}'; d='${META_DESC}'; m.update({'description':d} if d else {}); json.dump(m,open(p,'w'),indent=2); print('meta.json:',m['name'],'| packageVersion:',m['packageVersion'])"
-          (cd "$UNZIP_DIR" && zip -q - *) > "turnip_workdir/${ZIP_NAME}"
-          VK_PATCH=$(grep '^#define VK_HEADER_VERSION ' turnip_workdir/mesa/include/vulkan/vulkan_core.h | awk '{print $3}')
-          VK_MINOR=$(grep 'define TU_API_VERSION' turnip_workdir/mesa/src/freedreno/vulkan/tu_device.cc | grep -oP 'VK_MAKE_VERSION\(\s*[0-9]+,\s*\K[0-9]+')
+
+          python3 -c "
+          import json
+          p = '${UNZIP_DIR}/meta.json'
+          m = json.load(open(p))
+          m['name'] = '${META_NAME}'
+          m['packageVersion'] = '${DAY_NUM}'
+          m['description'] = '''${META_DESC}'''
+          json.dump(m, open(p, 'w'), indent=2)
+          print('meta.json:', m['name'], '| packageVersion:', m['packageVersion'])
+          "
+
+          (
+            cd "$UNZIP_DIR"
+            zip -q - *
+          ) > "turnip_workdir/${ZIP_NAME}"
+
+          VK_PATCH=$(grep '^#define VK_HEADER_VERSION ' \
+            turnip_workdir/mesa/include/vulkan/vulkan_core.h \
+            | awk '{print $3}')
+
+          VK_MINOR=$(grep 'define TU_API_VERSION' \
+            turnip_workdir/mesa/src/freedreno/vulkan/tu_device.cc \
+            | grep -oP 'VK_MAKE_VERSION\(\s*[0-9]+,\s*\K[0-9]+')
+
           VULKAN_VERSION="Vulkan 1.${VK_MINOR}.${VK_PATCH}"
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "mesa_version=${MESA_VERSION}" >> $GITHUB_OUTPUT
-          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
-          echo "githash=${GITHASH}" >> $GITHUB_OUTPUT
-          echo "githash_full=${GITHASH_FULL}" >> $GITHUB_OUTPUT
-          echo "commit_date=${COMMIT_DATE}" >> $GITHUB_OUTPUT
-          echo "commit_title=${COMMIT_TITLE}" >> $GITHUB_OUTPUT
-          echo "vulkan_version=${VULKAN_VERSION}" >> $GITHUB_OUTPUT
-          echo "zip_name=${ZIP_NAME}" >> $GITHUB_OUTPUT
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "mesa_version=${MESA_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "githash=${GITHASH}" >> "$GITHUB_OUTPUT"
+          echo "githash_full=${GITHASH_FULL}" >> "$GITHUB_OUTPUT"
+          echo "commit_date=${COMMIT_DATE}" >> "$GITHUB_OUTPUT"
+          echo "commit_title=${COMMIT_TITLE}" >> "$GITHUB_OUTPUT"
+          echo "vulkan_version=${VULKAN_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Write release body
         run: |
           VARIANT="${{ matrix.variant }}"
           LABEL="${{ matrix.release_label }}"
+
           {
             printf "> ⚠️ **EXPERIMENTAL %s BUILD — Not guaranteed stable. Use at your own risk.**\n\n" "${LABEL}"
             printf '%s\n\n' '---'
+
             printf "### Mesa Upstream\n\n"
             printf "| | |\n"
             printf "| :--- | :--- |\n"
-            printf "| **Version** | %s |\n"       "${{ steps.info.outputs.mesa_version }}"
-            printf "| **Commit** | [\`%s\`](https://gitlab.freedesktop.org/mesa/mesa/-/commit/%s) |\n" "${{ steps.info.outputs.githash }}" "${{ steps.info.outputs.githash_full }}"
+            printf "| **Version** | %s |\n" "${{ steps.info.outputs.mesa_version }}"
+            printf "| **Commit** | [\`%s\`](https://gitlab.freedesktop.org/mesa/mesa/-/commit/%s) |\n" \
+              "${{ steps.info.outputs.githash }}" \
+              "${{ steps.info.outputs.githash_full }}"
             printf "| **Vulkan version** | %s |\n" "${{ steps.info.outputs.vulkan_version }}"
-            printf "| **Commit date** | %s |\n"   "${{ steps.info.outputs.commit_date }}"
-            printf "| **Commit title** | %s |\n"  "${{ steps.info.outputs.commit_title }}"
-            printf "| **Build date** | %s |\n\n"  "${{ steps.info.outputs.build_date }}"
+            printf "| **Commit date** | %s |\n" "${{ steps.info.outputs.commit_date }}"
+            printf "| **Commit title** | %s |\n" "${{ steps.info.outputs.commit_title }}"
+            printf "| **Build date** | %s |\n\n" "${{ steps.info.outputs.build_date }}"
+
             printf '%s\n\n' '---'
-            printf "### What's In This Driver\n\n"
-            printf "Base: Mesa \`main\` + A8xx-specific patches. All variants share:\n\n"
-            printf "**Applied via [tu8_kgsl_26.patch](https://github.com/The412Banner/Banners-Turnip/blob/A8xx/patches/tu8_kgsl_26.patch):**\n\n"
-            printf '%s\n' "- **u_gralloc UBWC fix** — disables the \`gmsm\` magic check for Qualcomm gralloc buffer detection, which stopped working in newer gralloc versions."
-            printf '%s\n\n' "- **drm-shim entries** — adds A810/A825/A829 to the Mesa drm-shim device table."
-            printf "**Applied via \`fix_a8xx_dev_info.py\`:**\n\n"
-            printf '%s\n' "- Adds \`disable_gmem\` property to \`freedreno_dev_info.h\` — tells the driver to skip GMEM for A810."
-            printf '%s\n\n' "- Adds the GMEM disable check in \`tu_cmd_buffer.cc\`."
-            printf "**Applied via \`apply_a8xx_gpus.py\`:**\n\n"
-            printf '%s\n' "- Adds **A825** GPU entry — completely missing from mesa/main."
-            printf '%s\n' "- Adds \`chip_id=0x44010000\` to A810 for KGSL."
-            printf '%s\n' "- Adds \`disable_gmem = True\` to A810."
-            printf '%s\n\n' "- Adds extra chip IDs to A829 for additional device revisions."
+            printf "### Included Changes\n\n"
+
+            printf '%s\n' "- Full \`a8xx_gen8.patch\` stack"
+            printf '%s\n' "- A8xx GPU configuration and KGSL support"
+            printf '%s\n' "- A8xx shared-memory adjustments"
+            printf '%s\n' "- A8xx mesh-shader and wave32 support"
+            printf '%s\n' "- A8xx cube-map, bindless-descriptor, and command-memory hang fixes"
+
             if [[ "$VARIANT" == "a830-tuned" ]]; then
-              printf "**Additionally applied via \`tune_a830.py\` (A830 Tuned only):**\n\n"
-              printf '%s\n\n' "- Sets \`has_fs_tex_prefetch = False\` for A830 — Mesa upstream has a TODO noting this is likely needed for A830. Every other A8xx GPU (A810, A829, A840) already has this disabled. A830 was the only exception, inheriting \`True\` from the A7xx chain. This aligns A830 with all other A8xx hardware."
+              printf '%s\n' "- A830 texture-prefetch workaround enabled"
             fi
-            printf '%s\n\n' '---'
+
+            printf '\n%s\n\n' '---'
             printf "### Installation\n\n"
-            printf '%s\n' "- **BannerHub / BCI:** Component Manager → Add New Component → select the ZIP"
-            printf '%s\n' "- **Winlator / adrenotools:** load the ZIP in GPU driver settings"
+            printf '%s\n' "- **BannerHub / BCI:** Components → Add New Component → select the ZIP"
+            printf '%s\n' "- **Winlator / adrenotools:** Load the ZIP in the GPU driver settings"
           } > release_body.md
 
       - name: Upload Artifacts
@@ -143,7 +192,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.info.outputs.tag }}
+          tag_name: "v${{ steps.info.outputs.mesa_version }}-${{ steps.info.outputs.build_date }}-${{ matrix.variant }}"
           name: "Turnip ${{ steps.info.outputs.tag }} ${{ matrix.release_label }}"
           prerelease: true
           make_latest: false
